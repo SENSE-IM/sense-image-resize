@@ -1,32 +1,45 @@
-const AWS = require("aws-sdk");
-const { handler } = require("../dist/index");
+const { S3Client } = require("@aws-sdk/client-s3");
+const { handler } = require("../src/index");
+const { Readable } = require("stream");
 const fs = require("fs");
 const path = require("path");
+const sharp = require("sharp");
 
-jest.mock("aws-sdk", () => {
-  const S3 = {
-    getObject: jest.fn().mockReturnThis(),
-    promise: jest.fn(),
-  };
+jest.mock("@aws-sdk/client-s3", () => {
+  const mockSend = jest.fn();
   return {
-    S3: jest.fn(() => S3),
+    S3Client: jest.fn(() => ({
+      send: mockSend,
+    })),
+    GetObjectCommand: jest.fn(),
   };
 });
 
 describe("Lambda@Edge Handler", () => {
-  it("should resize the image and return the response", async () => {
+  let mockS3Client, imageBuffer, event, callback;
+
+  beforeEach(() => {
     const imagePath = path.resolve(__dirname, "./test.png");
-    const imageBuffer = fs.readFileSync(imagePath);
+    imageBuffer = fs.readFileSync(imagePath);
 
-    AWS.S3().getObject().promise.mockResolvedValue({ Body: imageBuffer });
+    mockS3Client = new S3Client({});
+    const mockStream = new Readable();
+    mockStream.push(imageBuffer);
+    mockStream.push(null);
 
-    const event = {
+    mockS3Client.send.mockResolvedValue({
+      Body: mockStream,
+      ContentLength: imageBuffer.length,
+      ContentType: "image/png",
+    });
+
+    event = {
       Records: [
         {
           cf: {
             request: {
               uri: "/test.png",
-              querystring: "w=400&h=300",
+              querystring: "w=200&h=300",
             },
             response: {
               status: "200",
@@ -40,13 +53,15 @@ describe("Lambda@Edge Handler", () => {
       ],
     };
 
-    const callback = jest.fn();
-    await handler(event, null, callback);
+    callback = jest.fn();
+  });
 
+  it("should call the callback with the correct response structure", async () => {
+    await handler(event, null, callback);
     expect(callback).toHaveBeenCalledWith(
       null,
       expect.objectContaining({
-        status: 200,
+        status: "200",
         statusDescription: "OK",
         body: expect.any(String),
         headers: expect.objectContaining({
@@ -55,5 +70,29 @@ describe("Lambda@Edge Handler", () => {
         bodyEncoding: "base64",
       })
     );
+  });
+
+  it("should return a base64 encoded image", async () => {
+    await handler(event, null, callback);
+    const base64 = callback.mock.calls[0][1]?.body;
+    expect(base64).toMatch(/^[A-Za-z0-9+/=]+$/); // base64 형식 검증
+  });
+
+  it("should resize the image to the specified dimensions", async () => {
+    await handler(event, null, callback);
+    const base64 = callback.mock.calls[0][1]?.body;
+    const resizedImage = Buffer.from(base64, "base64");
+
+    const { width, height } = await sharp(resizedImage).metadata();
+    expect(width).toBe(200);
+    expect(height).toBe(300);
+  });
+
+  it("should maintain the correct content type", async () => {
+    await handler(event, null, callback);
+    const response = callback.mock.calls[0][1];
+    expect(response.headers["content-type"]).toEqual([
+      { key: "Content-Type", value: "image/png" },
+    ]);
   });
 });
